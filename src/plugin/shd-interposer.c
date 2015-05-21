@@ -124,6 +124,7 @@ typedef int (*open_func)(const char*, int, mode_t);
 typedef int (*open64_func)(const char*, int, mode_t);
 typedef int (*creat_func)(const char*, mode_t);
 typedef FILE* (*fopen_func)(const char *, const char *);
+typedef FILE* (*fopen64_func)(const char *, const char *);
 typedef FILE* (*fdopen_func)(int, const char*);
 typedef int (*fclose_func)(FILE *);
 typedef int (*dup_func)(int);
@@ -134,10 +135,12 @@ typedef int (*__fxstat64_func)(int, int, struct stat64*);
 typedef int (*fstatfs_func)(int, struct statfs*);
 typedef int (*fstatfs64_func)(int, struct statfs64*);
 typedef off_t (*lseek_func)(int, off_t, int);
+typedef off64_t (*lseek64_func)(int, off64_t, int);
 typedef size_t (*pread_func)(int, void*, size_t, off_t);
 typedef int (*flock_func)(int, int);
 typedef int (*fsync_func)(int);
 typedef int (*ftruncate_func)(int, int);
+typedef int (*ftruncate64_func)(int, int);
 typedef int (*posix_fallocate_func)(int, int, int);
 
 /* time family */
@@ -231,6 +234,7 @@ typedef struct {
     open64_func open64;
     creat_func creat;
     fopen_func fopen;
+    fopen64_func fopen64;
     fdopen_func fdopen;
     dup_func dup;
     dup2_func dup2;
@@ -241,10 +245,12 @@ typedef struct {
     fstatfs_func fstatfs;
     fstatfs64_func fstatfs64;
     lseek_func lseek;
+    lseek64_func lseek64;
     pread_func pread;
     flock_func flock;
     fsync_func fsync;
     ftruncate_func ftruncate;
+    ftruncate64_func ftruncate64;
     posix_fallocate_func posix_fallocate;
 
     time_func time;
@@ -394,6 +400,7 @@ static void _interposer_globalInitialize() {
     SETSYM_OR_FAIL(director.libc.open64, "open64");
     SETSYM_OR_FAIL(director.libc.creat, "creat");
     SETSYM_OR_FAIL(director.libc.fopen, "fopen");
+    SETSYM_OR_FAIL(director.libc.fopen64, "fopen64");
     SETSYM_OR_FAIL(director.libc.fdopen, "fdopen");
     SETSYM_OR_FAIL(director.libc.dup, "dup");
     SETSYM_OR_FAIL(director.libc.dup2, "dup2");
@@ -403,10 +410,12 @@ static void _interposer_globalInitialize() {
     SETSYM_OR_FAIL(director.libc.__fxstat64, "__fxstat64");
     SETSYM_OR_FAIL(director.libc.fstatfs, "fstatfs");
     SETSYM_OR_FAIL(director.libc.lseek, "lseek");
+    SETSYM_OR_FAIL(director.libc.lseek64, "lseek64");
     SETSYM_OR_FAIL(director.libc.pread, "pread");
     SETSYM_OR_FAIL(director.libc.flock, "flock");
     SETSYM_OR_FAIL(director.libc.fsync, "fsync");
     SETSYM_OR_FAIL(director.libc.ftruncate, "ftruncate");
+    SETSYM_OR_FAIL(director.libc.ftruncate64, "ftruncate64");
     SETSYM_OR_FAIL(director.libc.posix_fallocate, "posix_fallocate");
     SETSYM_OR_FAIL(director.libc.time, "time");
     SETSYM_OR_FAIL(director.libc.clock_gettime, "clock_gettime");
@@ -2053,6 +2062,15 @@ FILE *fopen(const char *path, const char *mode) {
     return osfile;
 }
 
+FILE *fopen64(const char *path, const char *mode) {
+    if(shouldForwardToLibC()) {
+        ENSURE(libc, "", fopen64);
+        return director.libc.fopen64(path, mode);
+    } else {
+        return fopen(path, mode);
+    }
+}
+
 FILE *fdopen(int fd, const char *mode) {
     if(shouldForwardToLibC()) {
         ENSURE(libc, "", fdopen);
@@ -2331,6 +2349,15 @@ off_t lseek(int fd, off_t offset, int whence) {
     return (off_t)-1;
 }
 
+off64_t lseek64(int fd, off64_t offset, int whence) {
+    if (shouldForwardToLibC()) {
+        ENSURE(libc, "", lseek64);
+        return director.libc.lseek64(fd, offset, whence);
+    } else {
+        return lseek(fd, offset, whence);
+    }
+}
+
 int flock(int fd, int operation) {
     if (shouldForwardToLibC()) {
         ENSURE(libc, "", flock);
@@ -2407,6 +2434,15 @@ int ftruncate(int fd, off_t length) {
 
     errno = EBADF;
     return -1;
+}
+
+int ftruncate64(int fd, off64_t length) {
+    if (shouldForwardToLibC()) {
+        ENSURE(libc, "", ftruncate64);
+        return director.libc.ftruncate64(fd, length);
+    } else {
+        return ftruncate(fd, length);
+    }
 }
 
 int posix_fallocate(int fd, off_t offset, off_t len) {
