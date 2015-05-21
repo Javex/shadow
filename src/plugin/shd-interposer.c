@@ -2722,6 +2722,14 @@ int getnameinfo(const struct sockaddr* sa, socklen_t salen,
         return EAI_FAIL;
     }
 
+    if(flags & NI_NUMERICHOST) {
+        char *ip_str = inet_ntoa(((struct sockaddr_in*)sa)->sin_addr);
+        if(!ip_str)
+            return EAI_FAIL;
+        strncpy(host, ip_str, hostlen);
+        return 0;
+    }
+
     gint retval = 0;
     Host* node = _interposer_switchInShadowContext();
 
