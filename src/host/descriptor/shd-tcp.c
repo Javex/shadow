@@ -149,9 +149,9 @@ struct _TCP {
     /* tcp autotuning for the send and recv buffers */
     struct {
         gboolean isEnabled;
-        gint32 bytesCopied;
+        gsize bytesCopied;
         SimulationTime lastAdjustment;
-        guint32 space;
+        gsize space;
     } autotune;
 
     /* congestion object for implementing different types of congestion control (aimd, reno, cubic) */
@@ -253,7 +253,7 @@ static void _tcpserver_free(TCPServer* server) {
 
 void tcp_clearAllChildrenIfServer(TCP* tcp) {
     MAGIC_ASSERT(tcp);
-    if(tcp->server) {
+    if(tcp->server && tcp->server->children) {
         g_hash_table_destroy(tcp->server->children);
         tcp->server->children = NULL;
     }
@@ -509,7 +509,7 @@ static void _tcp_autotuneReceiveBuffer(TCP* tcp, guint bytesCopied) {
 
     SimulationTime now = worker_getCurrentTime();
 
-    tcp->autotune.bytesCopied += bytesCopied;
+    tcp->autotune.bytesCopied += (gsize)bytesCopied;
 
     if(tcp->autotune.lastAdjustment == 0) {
         tcp->autotune.lastAdjustment = now;
@@ -517,20 +517,20 @@ static void _tcp_autotuneReceiveBuffer(TCP* tcp, guint bytesCopied) {
     }
 
     SimulationTime time = now - tcp->autotune.lastAdjustment;
-    SimulationTime threshold = tcp->congestion->rttSmoothed * SIMTIME_ONE_MILLISECOND;
+    SimulationTime threshold = ((SimulationTime)tcp->congestion->rttSmoothed) * ((SimulationTime)SIMTIME_ONE_MILLISECOND);
 
     if(tcp->congestion->rttSmoothed == 0 || (time < threshold)) {
         return;
     }
 
-    guint space = 2 * tcp->autotune.bytesCopied;
+    gsize space = 2 * tcp->autotune.bytesCopied;
     space = MAX(space, tcp->autotune.space);
 
     gsize currentSize = socket_getInputBufferSize(&tcp->super);
-    if(((gsize)space) > currentSize) {
-        tcp->autotune.space = (guint32)space;
+    if(space > currentSize) {
+        tcp->autotune.space = space;
 
-        gsize newSize = (gsize) MIN(space, (guint)CONFIG_TCP_RMEM_MAX);
+        gsize newSize = (gsize) MIN(space, (gsize)CONFIG_TCP_RMEM_MAX);
         if(newSize > currentSize) {
             socket_setInputBufferSize(&tcp->super, newSize);
             debug("[autotune] input buffer size adjusted from %"G_GSIZE_FORMAT" to %"G_GSIZE_FORMAT,
@@ -556,18 +556,15 @@ static void _tcp_autotuneSendBuffer(TCP* tcp) {
      * 2200 <= sndmem < 2404.  For now hard code as 2404 and maybe later figure out how to calculate it
      * or sample from a distribution. */
 
-    gint sndmem = 2404;
-    gint demanded = tcp->congestion->window;
-    sndmem *= (2 * demanded);
+    gsize sndmem = 2404;
+    gsize demanded = (gsize)tcp->congestion->window;
+    gsize newSize = (gsize) MIN((gsize)(sndmem * 2 * demanded), (gsize)CONFIG_TCP_WMEM_MAX);
 
     gsize currentSize = socket_getOutputBufferSize(&tcp->super);
-    if(sndmem > currentSize) {
-        gsize newSize = (gsize) MIN(sndmem, (gint)CONFIG_TCP_WMEM_MAX);
-        if(newSize > currentSize) {
-            socket_setOutputBufferSize(&tcp->super, newSize);
-            debug("[autotune] output buffer size adjusted from %"G_GSIZE_FORMAT" to %"G_GSIZE_FORMAT,
-                    currentSize, newSize);
-        }
+    if(newSize > currentSize) {
+        socket_setOutputBufferSize(&tcp->super, newSize);
+        debug("[autotune] output buffer size adjusted from %"G_GSIZE_FORMAT" to %"G_GSIZE_FORMAT,
+                currentSize, newSize);
     }
 }
 
@@ -1429,6 +1426,20 @@ TCPProcessFlags _tcp_ackProcessing(TCP* tcp, Packet* packet, PacketTCPHeader *he
     return flags;
 }
 
+static void _tcp_logCongestionInfo(TCP* tcp) {
+    gsize outSize = socket_getOutputBufferSize(&tcp->super);
+    gsize outLength = socket_getOutputBufferLength(&tcp->super);
+    gsize inSize = socket_getInputBufferSize(&tcp->super);
+    gsize inLength = socket_getInputBufferLength(&tcp->super);
+    double ploss = (double) (tcp->info.retransmitCount / tcp->send.packetsSent);
+
+    congestionlog(tcp->congestion, "[CONG-AVOID] cwnd=%d ssthresh=%d rtt=%d "
+            "sndbufsize=%"G_GSIZE_FORMAT" sndbuflen=%"G_GSIZE_FORMAT" rcvbufsize=%"G_GSIZE_FORMAT" rcbuflen=%"G_GSIZE_FORMAT" "
+            "retrans=%"G_GSIZE_FORMAT" ploss=%f",
+            tcp->congestion->window, tcp->congestion->threshold, tcp->congestion->rttSmoothed,
+            outSize, outLength, inSize, inLength, tcp->info.retransmitCount, ploss);
+}
+
 /* return TRUE if the packet should be retransmitted */
 void tcp_processPacket(TCP* tcp, Packet* packet) {
     MAGIC_ASSERT(tcp);
@@ -1667,7 +1678,11 @@ void tcp_processPacket(TCP* tcp, Packet* packet) {
     }
 
     /* update the scoreboard and see if any packets have been lost */
-    flags |= scoreboard_update(tcp->retransmit.scoreboard, header.selectiveACKs, tcp->send.unacked, tcp->send.next);
+    GList* selectiveACKs = packet_copyTCPSelectiveACKs(packet);
+    flags |= scoreboard_update(tcp->retransmit.scoreboard, selectiveACKs, tcp->send.unacked, tcp->send.next);
+    if(selectiveACKs) {
+        g_list_free(selectiveACKs);
+    }
 
     /* update the last time stamp value (RFC 1323) */
     tcp->receive.lastTimestamp = header.timestampValue;
@@ -1681,21 +1696,13 @@ void tcp_processPacket(TCP* tcp, Packet* packet) {
     if(isAckDubious) {
         if((flags & TCP_PF_DATA_ACKED) && mayRaiseWindow) {
             tcpCongestion_avoidance(tcp->congestion, tcp->send.next, nPacketsAcked, tcp->send.unacked);
-
-            congestionlog(tcp->congestion, "[CONG-AVOID] cwnd=%d ssthresh=%d rtt=%d sndbufsize=%d sndbuflen=%d rcvbufsize=%d rcbuflen=%d retrans=%d ploss=%f", 
-                    tcp->congestion->window, tcp->congestion->threshold, tcp->congestion->rttSmoothed, 
-                    tcp->super.outputBufferLength, tcp->super.outputBufferSize, tcp->super.inputBufferLength, tcp->super.inputBufferSize, 
-                    tcp->info.retransmitCount, (float)tcp->info.retransmitCount / tcp->send.packetsSent);
+            _tcp_logCongestionInfo(tcp);
         }
 
         _tcp_fastRetransmitAlert(tcp, flags);
     } else if(flags & TCP_PF_DATA_ACKED) {
         tcpCongestion_avoidance(tcp->congestion, tcp->send.next, nPacketsAcked, tcp->send.unacked);
-
-        congestionlog(tcp->congestion, "[CONG-AVOID] cwnd=%d ssthresh=%d rtt=%d sndbufsize=%d sndbuflen=%d rcvbufsize=%d rcbuflen=%d retrans=%d ploss=%f", 
-                tcp->congestion->window, tcp->congestion->threshold, tcp->congestion->rttSmoothed, 
-                tcp->super.outputBufferLength, tcp->super.outputBufferSize, tcp->super.inputBufferLength, tcp->super.inputBufferSize, 
-                tcp->info.retransmitCount, (float)tcp->info.retransmitCount / tcp->send.packetsSent);
+        _tcp_logCongestionInfo(tcp);
     }
 
     /* now flush as many packets as we can to socket */

@@ -6,17 +6,27 @@
 
 #include "shd-tgen.h"
 
+/* 60 seconds default timeout */
+#define DEFAULT_XFER_TIMEOUT_USEC 60000000
+
 typedef enum _TGenTransferState {
     TGEN_XFER_COMMAND, TGEN_XFER_RESPONSE,
     TGEN_XFER_PAYLOAD, TGEN_XFER_CHECKSUM,
-    TGEN_XFER_DONE, TGEN_XFER_ERROR
+    TGEN_XFER_SUCCESS, TGEN_XFER_ERROR,
 } TGenTransferState;
+
+typedef enum _TGenTransferError {
+    TGEN_XFER_ERR_NONE, TGEN_XFER_ERR_READ, TGEN_XFER_ERR_WRITE,
+    TGEN_XFER_ERR_TIMEOUT, TGEN_XFER_ERR_PROXY, TGEN_XFER_ERR_MISC,
+} TGenTransferError;
 
 struct _TGenTransfer {
     /* transfer progress and context information */
     TGenTransferState state;
+    TGenTransferError error;
     TGenEvent events;
     gchar* string;
+    gint64 timeoutUSecs;
 
     /* command information */
     gsize id;
@@ -56,6 +66,7 @@ struct _TGenTransfer {
         gint64 lastBytesStatusReport;
         gint64 lastTimeStatusReport;
         gint64 lastTimeErrorReport;
+        gint64 lastProgress;
     } time;
 
     /* notification and parameters for when this transfer finishes */
@@ -99,12 +110,36 @@ static const gchar* _tgentransfer_stateToString(TGenTransferState state) {
         case TGEN_XFER_CHECKSUM: {
             return "CHECKSUM";
         }
-        case TGEN_XFER_DONE: {
-            return "DONE";
+        case TGEN_XFER_SUCCESS: {
+            return "SUCCESS";
         }
         case TGEN_XFER_ERROR:
         default: {
             return "ERROR";
+        }
+    }
+}
+
+static const gchar* _tgentransfer_errorToString(TGenTransferError error) {
+    switch(error) {
+        case TGEN_XFER_ERR_NONE: {
+            return "NONE";
+        }
+        case TGEN_XFER_ERR_READ: {
+            return "READ";
+        }
+        case TGEN_XFER_ERR_WRITE: {
+            return "WRITE";
+        }
+        case TGEN_XFER_ERR_TIMEOUT: {
+            return "TIMEOUT";
+        }
+        case TGEN_XFER_ERR_PROXY: {
+            return "PROXY";
+        }
+        case TGEN_XFER_ERR_MISC:
+        default: {
+            return "MISC";
         }
     }
 }
@@ -115,9 +150,10 @@ static const gchar* _tgentransfer_toString(TGenTransfer* transfer) {
     if(!transfer->string) {
         GString* stringBuffer = g_string_new(NULL);
 
-        g_string_printf(stringBuffer, "(%"G_GSIZE_FORMAT"-%s-%s-%"G_GSIZE_FORMAT"-%s-%"G_GSIZE_FORMAT")",
+        g_string_printf(stringBuffer, "(%"G_GSIZE_FORMAT"-%s-%s-%"G_GSIZE_FORMAT"-%s-%"G_GSIZE_FORMAT"-state=%s-error=%s)",
                 transfer->id, transfer->name, _tgentransfer_typeToString(transfer),
-                transfer->size, transfer->remoteName, transfer->remoteID);
+                transfer->size, transfer->remoteName, transfer->remoteID,
+                _tgentransfer_stateToString(transfer->state), _tgentransfer_errorToString(transfer->error));
 
         transfer->string = g_string_free(stringBuffer, FALSE);
     }
@@ -138,6 +174,15 @@ static void _tgentransfer_changeState(TGenTransfer* transfer, TGenTransferState 
     tgen_info("transfer %s moving from state %s to state %s", _tgentransfer_toString(transfer),
             _tgentransfer_stateToString(transfer->state), _tgentransfer_stateToString(state));
     transfer->state = state;
+    _tgentransfer_resetString(transfer);
+}
+
+static void _tgentransfer_changeError(TGenTransfer* transfer, TGenTransferError error) {
+    TGEN_ASSERT(transfer);
+    tgen_info("transfer %s moving from error %s to error %s", _tgentransfer_toString(transfer),
+            _tgentransfer_errorToString(transfer->error), _tgentransfer_errorToString(error));
+    transfer->error = error;
+    _tgentransfer_resetString(transfer);
 }
 
 static gboolean _tgentransfer_getLine(TGenTransfer* transfer) {
@@ -156,11 +201,13 @@ static gboolean _tgentransfer_getLine(TGenTransfer* transfer) {
 
         if(bytes < 0 && errno != EAGAIN) {
             _tgentransfer_changeState(transfer, TGEN_XFER_ERROR);
+            _tgentransfer_changeError(transfer, TGEN_XFER_ERR_READ);
             tgen_critical("read(): transport %s transfer %s error %i: %s",
                     tgentransport_toString(transfer->transport), _tgentransfer_toString(transfer),
                     errno, g_strerror(errno));
         } else if(bytes == 0) {
             _tgentransfer_changeState(transfer, TGEN_XFER_ERROR);
+            _tgentransfer_changeError(transfer, TGEN_XFER_ERR_READ);
             tgen_critical("read(): transport %s transfer %s closed unexpectedly",
                     tgentransport_toString(transfer->transport), _tgentransfer_toString(transfer));
         } else if(bytes == 1) {
@@ -227,6 +274,7 @@ static void _tgentransfer_readCommand(TGenTransfer* transfer) {
         /* payload phase is next unless there was an error parsing */
         if(hasError) {
             _tgentransfer_changeState(transfer, TGEN_XFER_ERROR);
+            _tgentransfer_changeError(transfer, TGEN_XFER_ERR_READ);
         } else {
             /* we need to update our string with the new command info */
             _tgentransfer_resetString(transfer);
@@ -270,6 +318,7 @@ static void _tgentransfer_readResponse(TGenTransfer* transfer) {
         /* payload phase is next unless there was an error parsing */
         if(hasError) {
             _tgentransfer_changeState(transfer, TGEN_XFER_ERROR);
+            _tgentransfer_changeError(transfer, TGEN_XFER_ERR_READ);
         } else {
             /* we need to update our string with the new command info */
             _tgentransfer_resetString(transfer);
@@ -298,11 +347,13 @@ static void _tgentransfer_readPayload(TGenTransfer* transfer) {
 
             if(bytes < 0 && errno != EAGAIN) {
                 _tgentransfer_changeState(transfer, TGEN_XFER_ERROR);
+                _tgentransfer_changeError(transfer, TGEN_XFER_ERR_READ);
                 tgen_critical("read(): transport %s transfer %s error %i: %s",
                         tgentransport_toString(transfer->transport), _tgentransfer_toString(transfer),
                         errno, g_strerror(errno));
             } else if(bytes == 0) {
                 _tgentransfer_changeState(transfer, TGEN_XFER_ERROR);
+                _tgentransfer_changeError(transfer, TGEN_XFER_ERR_READ);
                 tgen_critical("read(): transport %s transfer %s closed unexpectedly",
                         tgentransport_toString(transfer->transport), _tgentransfer_toString(transfer));
             } else if(bytes > 0) {
@@ -329,10 +380,8 @@ static void _tgentransfer_readChecksum(TGenTransfer* transfer) {
 
     if(_tgentransfer_getLine(transfer)) {
         /* transfer is done */
-        _tgentransfer_changeState(transfer, TGEN_XFER_DONE);
+        _tgentransfer_changeState(transfer, TGEN_XFER_SUCCESS);
         transfer->time.checksum = g_get_monotonic_time();
-        /* no more reads or writes */
-        transfer->events = TGEN_EVENT_DONE;
 
         /* we have read the entire checksum from the other end */
         gssize sha1Length = g_checksum_type_get_length(G_CHECKSUM_MD5);
@@ -388,7 +437,7 @@ static void _tgentransfer_onReadable(TGenTransfer* transfer) {
     }
 
     if(transfer->readBuffer ||
-            (transfer->type == TGEN_TYPE_GET && transfer->state != TGEN_XFER_DONE)) {
+            (transfer->type == TGEN_TYPE_GET && transfer->state != TGEN_XFER_SUCCESS)) {
         /* we have more to read */
         transfer->events |= TGEN_EVENT_READ;
     } else {
@@ -397,8 +446,13 @@ static void _tgentransfer_onReadable(TGenTransfer* transfer) {
     }
 
     gsize endBytes = transfer->bytes.totalRead;
+    gsize totalBytes = endBytes - startBytes;
     tgen_debug("active transfer %s read %"G_GSIZE_FORMAT" more bytes",
-            _tgentransfer_toString(transfer), endBytes - startBytes);
+            _tgentransfer_toString(transfer), totalBytes);
+
+    if(totalBytes > 0) {
+        transfer->time.lastProgress = g_get_monotonic_time();
+    }
 }
 
 static GString* _tgentransfer_getRandomString(gsize size) {
@@ -423,11 +477,13 @@ static gsize _tgentransfer_flushOut(TGenTransfer* transfer) {
 
     if(bytes < 0 && errno != EAGAIN) {
         _tgentransfer_changeState(transfer, TGEN_XFER_ERROR);
+        _tgentransfer_changeError(transfer, TGEN_XFER_ERR_WRITE);
         tgen_critical("write(): transport %s transfer %s error %i: %s",
                 tgentransport_toString(transfer->transport), _tgentransfer_toString(transfer),
                 errno, g_strerror(errno));
     } else if(bytes == 0) {
         _tgentransfer_changeState(transfer, TGEN_XFER_ERROR);
+        _tgentransfer_changeError(transfer, TGEN_XFER_ERR_WRITE);
         tgen_critical("write(): transport %s transfer %s closed unexpectedly",
                 tgentransport_toString(transfer->transport), _tgentransfer_toString(transfer));
     } else if(bytes > 0) {
@@ -534,8 +590,7 @@ static void _tgentransfer_writeChecksum(TGenTransfer* transfer) {
 
     if(!transfer->writeBuffer) {
         /* entire checksum was sent, we are now done */
-        _tgentransfer_changeState(transfer, TGEN_XFER_DONE);
-        transfer->events |= TGEN_EVENT_DONE;
+        _tgentransfer_changeState(transfer, TGEN_XFER_SUCCESS);
         transfer->time.checksum = g_get_monotonic_time();
     } else {
         /* unable to send entire checksum, wait for next chance to write */
@@ -576,8 +631,13 @@ static void _tgentransfer_onWritable(TGenTransfer* transfer) {
     }
 
     gsize endBytes = transfer->bytes.totalWrite;
+    gsize totalBytes = endBytes - startBytes;
     tgen_debug("active transfer %s wrote %"G_GSIZE_FORMAT" more bytes",
-                _tgentransfer_toString(transfer), endBytes - startBytes);
+                _tgentransfer_toString(transfer), totalBytes);
+
+    if(totalBytes > 0) {
+        transfer->time.lastProgress = g_get_monotonic_time();
+    }
 }
 
 static gchar* _tgentransfer_getBytesStatusReport(TGenTransfer* transfer) {
@@ -621,58 +681,65 @@ static gchar* _tgentransfer_getTimeStatusReport(TGenTransfer* transfer) {
 static void _tgentransfer_log(TGenTransfer* transfer, gboolean wasActive) {
     TGEN_ASSERT(transfer);
 
-    if(transfer->state != TGEN_XFER_DONE && wasActive) {
-        gchar* bytesMessage = _tgentransfer_getBytesStatusReport(transfer);
 
-        tgen_info("[transfer-status] transport %s transfer %s %s",
-                tgentransport_toString(transfer->transport),
-                _tgentransfer_toString(transfer), bytesMessage);
+    if(transfer->state == TGEN_XFER_ERROR) {
+        /* we had an error at some point and will unlikely be able to complete.
+         * only log an error once. */
+        if(transfer->time.lastTimeErrorReport == 0) {
+            gchar* bytesMessage = _tgentransfer_getBytesStatusReport(transfer);
 
-        transfer->time.lastBytesStatusReport = g_get_monotonic_time();;
-        g_free(bytesMessage);
-    }
+            tgen_message("[transfer-error] transport %s transfer %s %s",
+                    tgentransport_toString(transfer->transport),
+                    _tgentransfer_toString(transfer), bytesMessage);
 
-    if(transfer->state == TGEN_XFER_DONE && transfer->time.lastTimeStatusReport == 0) {
-        gchar* bytesMessage = _tgentransfer_getBytesStatusReport(transfer);
-        gchar* timeMessage = _tgentransfer_getTimeStatusReport(transfer);
+            gint64 now = g_get_monotonic_time();
+            transfer->time.lastBytesStatusReport = now;
+            transfer->time.lastTimeErrorReport = now;
+            g_free(bytesMessage);
+        }
+    } else if(transfer->state == TGEN_XFER_SUCCESS) {
+        /* we completed the transfer. yay. only log once. */
+        if(transfer->time.lastTimeStatusReport == 0) {
+            gchar* bytesMessage = _tgentransfer_getBytesStatusReport(transfer);
+            gchar* timeMessage = _tgentransfer_getTimeStatusReport(transfer);
 
-        tgen_message("[transfer-complete] transport %s transfer %s %s %s",
-                tgentransport_toString(transfer->transport),
-                _tgentransfer_toString(transfer), bytesMessage, timeMessage);
+            tgen_message("[transfer-complete] transport %s transfer %s %s %s",
+                    tgentransport_toString(transfer->transport),
+                    _tgentransfer_toString(transfer), bytesMessage, timeMessage);
 
-        gint64 now = g_get_monotonic_time();
-        transfer->time.lastBytesStatusReport = now;
-        transfer->time.lastTimeStatusReport = now;
-        g_free(bytesMessage);
-        g_free(timeMessage);
-    }
+            gint64 now = g_get_monotonic_time();
+            transfer->time.lastBytesStatusReport = now;
+            transfer->time.lastTimeStatusReport = now;
+            g_free(bytesMessage);
+            g_free(timeMessage);
+        }
+    } else {
+        /* the transfer is still working. only log on new activity */
+        if(wasActive) {
+            gchar* bytesMessage = _tgentransfer_getBytesStatusReport(transfer);
 
-    if(transfer->state == TGEN_XFER_ERROR && transfer->time.lastTimeErrorReport == 0) {
-        gchar* bytesMessage = _tgentransfer_getBytesStatusReport(transfer);
+            tgen_info("[transfer-status] transport %s transfer %s %s",
+                    tgentransport_toString(transfer->transport),
+                    _tgentransfer_toString(transfer), bytesMessage);
 
-        tgen_message("[transfer-error] transport %s transfer %s %s",
-                tgentransport_toString(transfer->transport),
-                _tgentransfer_toString(transfer), bytesMessage);
-
-        gint64 now = g_get_monotonic_time();
-        transfer->time.lastBytesStatusReport = now;
-        transfer->time.lastTimeErrorReport = now;
-        g_free(bytesMessage);
+            transfer->time.lastBytesStatusReport = g_get_monotonic_time();;
+            g_free(bytesMessage);
+        }
     }
 }
 
-TGenEvent tgentransfer_onEvent(TGenTransfer* transfer, gint descriptor, TGenEvent events) {
-    TGEN_ASSERT(transfer);
-
-    /* check if the transport layer wants to do some IO, and redirect if needed */
-    if(transfer->transport && tgentransport_wantsEvents(transfer->transport)) {
-        TGenEvent retEvents = tgentransport_onEvent(transfer->transport, events);
-        if(retEvents == TGEN_EVENT_NONE) {
-            /* proxy failed */
-            tgen_critical("proxy connection failed, transfer cannot begin");
-            transfer->state = TGEN_XFER_ERROR;
-            return TGEN_EVENT_DONE;
-        } else if(retEvents & TGEN_EVENT_DONE) {
+static TGenEvent _tgentransfer_runTransportEventLoop(TGenTransfer* transfer, TGenEvent events) {
+    TGenEvent retEvents = tgentransport_onEvent(transfer->transport, events);
+    if(retEvents == TGEN_EVENT_NONE) {
+        /* proxy failed */
+        tgen_critical("proxy connection failed, transfer cannot begin");
+        _tgentransfer_changeState(transfer, TGEN_XFER_ERROR);
+        _tgentransfer_changeError(transfer, TGEN_XFER_ERR_PROXY);
+        _tgentransfer_log(transfer, FALSE);
+        return TGEN_EVENT_DONE;
+    } else {
+        transfer->time.lastProgress = g_get_monotonic_time();
+        if(retEvents & TGEN_EVENT_DONE) {
             /* proxy is connected and ready, now its our turn */
             return TGEN_EVENT_READ|TGEN_EVENT_WRITE;
         } else {
@@ -680,8 +747,9 @@ TGenEvent tgentransfer_onEvent(TGenTransfer* transfer, gint descriptor, TGenEven
             return retEvents;
         }
     }
+}
 
-    /* transport layer is happy, our turn to start the transfer */
+static TGenEvent _tgentransfer_runTransferEventLoop(TGenTransfer* transfer, TGenEvent events) {
     gsize readBytesBefore = transfer->bytes.payloadRead;
     gsize writeBytesBefore = transfer->bytes.payloadWrite;
 
@@ -698,23 +766,70 @@ TGenEvent tgentransfer_onEvent(TGenTransfer* transfer, gint descriptor, TGenEven
             transfer->bytes.payloadWrite > writeBytesBefore) ? TRUE : FALSE;
     _tgentransfer_log(transfer, wasActive);
 
-    if((transfer->events & TGEN_EVENT_DONE) && transfer->notify) {
-        /* execute the callback to notify that we are complete */
-        transfer->notify(transfer->data1, transfer->data2, transfer);
-        /* make sure we only do teh notification once */
-        transfer->notify = NULL;
-    }
-
-    if(transfer->state == TGEN_XFER_ERROR) {
-        transfer->events |= TGEN_EVENT_DONE;
-    }
-
     return transfer->events;
 }
 
-TGenTransfer* tgentransfer_new(gsize id, TGenTransferType type, gsize size, TGenTransport* transport,
-        TGenTransfer_notifyCompleteFunc notify, gpointer data1, gpointer data2,
-        GDestroyNotify destructData1, GDestroyNotify destructData2) {
+TGenEvent tgentransfer_onEvent(TGenTransfer* transfer, gint descriptor, TGenEvent events) {
+    TGEN_ASSERT(transfer);
+
+    TGenEvent retEvents = TGEN_EVENT_NONE;
+
+    if(transfer->transport && tgentransport_wantsEvents(transfer->transport)) {
+        /* transport layer wants to do some IO, redirect as needed */
+        retEvents = _tgentransfer_runTransportEventLoop(transfer, events);
+    } else {
+        /* transport layer is happy, our turn to start the transfer */
+        retEvents = _tgentransfer_runTransferEventLoop(transfer, events);
+    }
+
+    if((transfer->state == TGEN_XFER_SUCCESS) || (transfer->state == TGEN_XFER_ERROR)) {
+        /* send back that we are done */
+        transfer->events |= TGEN_EVENT_DONE;
+        retEvents |= TGEN_EVENT_DONE;
+
+        if(transfer->notify) {
+            /* execute the callback to notify that we are complete */
+            gboolean wasSuccess = transfer->error == TGEN_XFER_ERR_NONE ? TRUE : FALSE;
+            transfer->notify(transfer->data1, transfer->data2, wasSuccess);
+            /* make sure we only do the notification once */
+            transfer->notify = NULL;
+        }
+    }
+
+    return retEvents;
+}
+
+gboolean tgentransfer_onCheckTimeout(TGenTransfer* transfer, gint descriptor) {
+    TGEN_ASSERT(transfer);
+
+    /* the io module is checking to see if we are in a timeout state. if we are, then
+     * the transfer will be cancel will be de-registered and destroyed. */
+    if((transfer->time.lastProgress > 0) &&
+            (g_get_monotonic_time() >= transfer->time.lastProgress + transfer->timeoutUSecs)) {
+        /* log this transfer as a timeout */
+        _tgentransfer_changeState(transfer, TGEN_XFER_ERROR);
+        _tgentransfer_changeError(transfer, TGEN_XFER_ERR_TIMEOUT);
+        transfer->events |= TGEN_EVENT_DONE;
+        _tgentransfer_log(transfer, FALSE);
+
+        /* we have to call notify so the next transfer can start */
+        if(transfer->notify) {
+            /* execute the callback to notify that we failed with a timeout error */
+            transfer->notify(transfer->data1, transfer->data2, FALSE);
+            /* make sure we only do the notification once */
+            transfer->notify = NULL;
+        }
+        /* this transfer will be destroyed by the io module */
+        return TRUE;
+    } else {
+        /* this transfer is still in progress */
+        return FALSE;
+    }
+}
+
+TGenTransfer* tgentransfer_new(gsize id, TGenTransferType type, gsize size, guint64 timeout,
+        TGenTransport* transport, TGenTransfer_notifyCompleteFunc notify,
+        gpointer data1, gpointer data2, GDestroyNotify destructData1, GDestroyNotify destructData2) {
     TGenTransfer* transfer = g_new0(TGenTransfer, 1);
     transfer->magic = TGEN_MAGIC;
     transfer->refcount = 1;
@@ -729,6 +844,9 @@ TGenTransfer* tgentransfer_new(gsize id, TGenTransferType type, gsize size, TGen
 
     transfer->events = TGEN_EVENT_READ;
     transfer->id = id;
+
+    /* the timeout after which we abandon this transfer */
+    transfer->timeoutUSecs = (gint64)(timeout > 0 ? (timeout * 1000) : DEFAULT_XFER_TIMEOUT_USEC);
 
     gchar nameBuffer[256];
     memset(nameBuffer, 0, 256);

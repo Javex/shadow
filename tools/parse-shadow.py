@@ -129,7 +129,7 @@ def single_parse(args):
             if 'slave_heartbeat' in parts[5] or (args.doshadow and 'shadow-heartbeat' in parts[6]): shadow_helper(sdata, parts)
             elif args.dotor and 'torctl-log' in parts[6]: tor_helper(tdata, parts)
             elif args.dofiletransfer and 'fg-download-complete' in parts[6]: filetransfer_helper(fdata, parts)
-            elif args.dotgen and 'transfer-complete' in parts[6]: tgen_helper(tgendata, parts)
+            elif args.dotgen and ('transfer-complete' in parts[6] or 'transfer-error' in parts[6]): tgen_helper(tgendata, parts)
         except: continue
     if 'xzproc' in args: args.xzproc.wait()
     if len(sdata) > 0: dump(args, sdata, SHADOWJSON)
@@ -202,7 +202,7 @@ def filterworker_main(args, filterQ, shadowQ, torQ, filetransferQ, tgenQ):
                 if 'slave_heartbeat' in parts[5] or (args.doshadow and 'shadow-heartbeat' in parts[6]): shadowbatch.append(parts)
                 elif args.dotor and 'torctl-log' in parts[6]: torbatch.append(parts)
                 elif args.dofiletransfer and 'fg-download-complete' in parts[6]: filetransferbatch.append(parts)
-                elif args.dotgen and 'transfer-complete' in parts[6]: tgenbatch.append(parts)
+                elif args.dotgen and ('transfer-complete' in parts[6] or 'transfer-error' in parts[6]): tgenbatch.append(parts)
             except: pass
             # send out full batches
             if len(shadowbatch) >= PROCBATCHLEN:
@@ -284,7 +284,7 @@ def shadow_helper(d, parts):
     remoteout = mods[4].split(',')
 
     #labels = ['count_total', 'count_data', 'count_control', 'count_retrans', 'bytes_total', 'bytes_data', 'bytes_control', 'bytes_retrans']
-    labels = ['bytes_total', 'bytes_data', 'bytes_control', 'bytes_retrans']
+    labels = ['bytes_total', 'bytes_control_header', 'bytes_control_header_retrans', 'bytes_data_header', 'bytes_data_payload', 'bytes_data_header_retrans', 'bytes_data_payload_retrans']
 
     if 'nodes' not in d: d['nodes'] = {}
     if name not in d['nodes']:
@@ -296,23 +296,34 @@ def shadow_helper(d, parts):
         if second not in d['nodes'][name]['recv'][label]: d['nodes'][name]['recv'][label][second] = 0
         if second not in d['nodes'][name]['send'][label]: d['nodes'][name]['send'][label][second] = 0
 
-    #d['nodes'][name]['recv']['count_total'][second] += int(remotein[0])
-    #d['nodes'][name]['recv']['count_data'][second] += int(remotein[4])
-    #d['nodes'][name]['recv']['count_control'][second] += int(remotein[6])
-    #d['nodes'][name]['recv']['count_retrans'][second] += int(remotein[8])
-    d['nodes'][name]['recv']['bytes_total'][second] += int(remotein[1])
-    d['nodes'][name]['recv']['bytes_data'][second] += int(remotein[2]) + int(remotein[5])
-    d['nodes'][name]['recv']['bytes_control'][second] += int(remotein[7])
-    d['nodes'][name]['recv']['bytes_retrans'][second] += int(remotein[9]) + int(remotein[10])
+    '''
+    a packet is a data packet if it contains a payload, and a control packet otherwise.
+    each packet potentially has a header and a payload, and each packet is either
+    a first transmission or a re-transmission.
 
-    #d['nodes'][name]['send']['count_total'][second] += int(remoteout[0])
-    #d['nodes'][name]['send']['count_data'][second] += int(remoteout[4])
-    #d['nodes'][name]['send']['count_control'][second] += int(remoteout[6])
-    #d['nodes'][name]['send']['count_retrans'][second] += int(remoteout[8])
+    shadow prints the following in its heartbeat messages for the bytes counters:
+    packets-total,bytes-total,
+    packets-control,bytes-control-header,
+    packets-control-retrans,bytes-control-header-retrans,
+    packets-data,bytes-data-header,bytes-data-payload,
+    packets-data-retrans,bytes-data-header-retrans,bytes-data-payload-retrans
+    '''
+    # packet counts are also available, but we are ignoring them
+    d['nodes'][name]['recv']['bytes_total'][second] += int(remotein[1])
+    d['nodes'][name]['recv']['bytes_control_header'][second] += int(remotein[3])
+    d['nodes'][name]['recv']['bytes_control_header_retrans'][second] += int(remotein[5])
+    d['nodes'][name]['recv']['bytes_data_header'][second] += int(remotein[7])
+    d['nodes'][name]['recv']['bytes_data_payload'][second] += int(remotein[8])
+    d['nodes'][name]['recv']['bytes_data_header_retrans'][second] += int(remotein[10])
+    d['nodes'][name]['recv']['bytes_data_payload_retrans'][second] += int(remotein[11])
+
     d['nodes'][name]['send']['bytes_total'][second] += int(remoteout[1])
-    d['nodes'][name]['send']['bytes_data'][second] += int(remoteout[2]) + int(remoteout[5])
-    d['nodes'][name]['send']['bytes_control'][second] += int(remoteout[7])
-    d['nodes'][name]['send']['bytes_retrans'][second] += int(remoteout[9]) + int(remoteout[10])
+    d['nodes'][name]['send']['bytes_control_header'][second] += int(remoteout[3])
+    d['nodes'][name]['send']['bytes_control_header_retrans'][second] += int(remoteout[5])
+    d['nodes'][name]['send']['bytes_data_header'][second] += int(remoteout[7])
+    d['nodes'][name]['send']['bytes_data_payload'][second] += int(remoteout[8])
+    d['nodes'][name]['send']['bytes_data_header_retrans'][second] += int(remoteout[10])
+    d['nodes'][name]['send']['bytes_data_payload_retrans'][second] += int(remoteout[11])
 
 def tor_helper(d, parts):
     if 'BW' != parts[9]: return
@@ -354,18 +365,28 @@ def tgen_helper(d, parts):
     if 'read' not in iodirection: return
 
     bytes = int(ioparts[1].split('/')[0])
-    cmdtime = int(parts[15].split('=')[1])/1000.0
-    rsptime = int(parts[16].split('=')[1])/1000.0
-    fbtime = int(parts[17].split('=')[1])/1000.0
-    lbtime = int(parts[18].split('=')[1])/1000.0
-    chktime = int(parts[19].split('=')[1])/1000.0
 
     if 'nodes' not in d: d['nodes'] = {}
-    if name not in d['nodes']: d['nodes'][name] = {}
-    if bytes not in d['nodes'][name]: d['nodes'][name][bytes] = {'firstbyte':[], 'lastbyte':[]}
+    if name not in d['nodes']: d['nodes'][name] = {'firstbyte':{}, 'lastbyte':{}, 'errors':{}}
 
-    d['nodes'][name][bytes]['firstbyte'].append(fbtime-cmdtime)
-    d['nodes'][name][bytes]['lastbyte'].append(lbtime-cmdtime)
+    if 'transfer-complete' in parts[6]:
+        cmdtime = int(parts[15].split('=')[1])/1000.0
+        rsptime = int(parts[16].split('=')[1])/1000.0
+        fbtime = int(parts[17].split('=')[1])/1000.0
+        lbtime = int(parts[18].split('=')[1])/1000.0
+        chktime = int(parts[19].split('=')[1])/1000.0
+
+        if bytes not in d['nodes'][name]['firstbyte']: d['nodes'][name]['firstbyte'][bytes] = []
+        d['nodes'][name]['firstbyte'][bytes].append(fbtime-cmdtime)
+
+        if bytes not in d['nodes'][name]['lastbyte']: d['nodes'][name]['lastbyte'][bytes] = []
+        d['nodes'][name]['lastbyte'][bytes].append(lbtime-cmdtime)
+
+    elif 'transfer-error' in parts[6]:
+        code = parts[10].strip('()').split('-')[7].split('=')[1]
+
+        if code not in d['nodes'][name]['errors']: d['nodes'][name]['errors'][code] = []
+        d['nodes'][name]['errors'][code].append(bytes)
 
 def dump(args, data, filename, compress=True):
     if not os.path.exists(args.prefix): os.makedirs(args.prefix)
